@@ -57,6 +57,23 @@ fn is_directory_empty<P: AsRef<Path>>(p: P) -> Result<bool, io::Error> {
     Ok(entries.next().is_none())
 }
 
+fn patch_abseil_apple_single_arch_copts() {
+    let path = Path::new("grpc/third_party/abseil-cpp/absl/copts/AbseilConfigureCopts.cmake");
+    let mut contents = fs::read_to_string(path).unwrap();
+    let old = "if(APPLE AND CMAKE_CXX_COMPILER_ID MATCHES [[Clang]])";
+    let new = "if(APPLE AND CMAKE_CXX_COMPILER_ID MATCHES [[Clang]]\n   AND (NOT CMAKE_OSX_ARCHITECTURES OR CMAKE_OSX_ARCHITECTURES MATCHES [[;]]))";
+
+    if contents.contains(new) {
+        return;
+    }
+    if !contents.contains(old) {
+        panic!("unsupported Abseil CMake Randen copts layout");
+    }
+
+    contents = contents.replacen(old, new, 1);
+    fs::write(path, contents).unwrap();
+}
+
 fn trim_start<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     if s.starts_with(prefix) {
         Some(s.trim_start_matches(prefix))
@@ -155,12 +172,20 @@ fn build_grpc(cc: &mut cc::Build, library: &str) {
     prepare_grpc();
 
     let target = env::var("TARGET").unwrap();
+    let host = env::var("HOST").unwrap();
+    if target.ends_with("apple-darwin") {
+        patch_abseil_apple_single_arch_copts();
+    }
     let dst = {
         let mut config = CmakeConfig::new("grpc");
 
         if get_env("CARGO_CFG_TARGET_OS").is_some_and(|s| s == "macos") {
             config.cxxflag("-stdlib=libc++");
+            config.cxxflag("-Wno-missing-template-arg-list-after-template-kw");
             println!("cargo:rustc-link-lib=resolv");
+        }
+        if host == target && target.ends_with("apple-darwin") {
+            config.no_default_flags(true);
         }
 
         // Ensure CoreFoundation be found in macos or ios
@@ -227,6 +252,8 @@ fn build_grpc(cc: &mut cc::Build, library: &str) {
         config.define("gRPC_BENCHMARK_PROVIDER", "none");
         // Check https://github.com/protocolbuffers/protobuf/issues/12185
         config.define("ABSL_ENABLE_INSTALL", "ON");
+        // CMake 4 removed compatibility with projects that declare very old minimum versions.
+        config.define("CMAKE_POLICY_VERSION_MINIMUM", "3.5");
 
         // `package` should only be set for secure feature, otherwise cmake will always search for
         // ssl library.
